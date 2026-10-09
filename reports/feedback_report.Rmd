@@ -1,0 +1,124 @@
+---
+title: "FCECPR Training Registration Form"
+subtitle: "Open-ended feedback (anonymized)"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  word_document:
+    reference_docx: reference.docx
+    md_extensions: "-tex_math_single_backslash"
+params:
+  project_dir: "."
+  data_rds: "output/prepared_data.rds"
+  seed: 2026
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, dpi = 200)
+source(file.path(params$project_dir, "R", "functions.R"))
+dat <- readRDS(params$data_rds)
+
+fb_q <- dat$questions %>% filter(is_feedback) %>% arrange(order)
+open_q <- fb_q %>% filter(type == "text")
+rated_q <- fb_q %>% filter(type %in% c("choice", "matrix"))
+
+# Anyone who answered at least one feedback question
+fb_answers <- dat$answers %>% filter(tag %in% fb_q$tag, !is.na(num))
+n_fb <- n_distinct(fb_answers$ResponseId)
+
+# Names to strip from comments: everything identifying typed anywhere in the form
+id_cols <- c("Provider", "Contact_1", "Contact_4", "Trainers_1", "Trainers_3", "Trainers_5",
+             "Signer_1", "Signer_3", "Signature", "Location_1")
+id_cols <- intersect(id_cols, names(dat$raw_numeric))
+names_to_redact <- unlist(dat$raw_numeric[id_cols], use.names = FALSE)
+```
+
+```{r intro, results = "asis"}
+cat(sprintf(paste0(
+  "%d respondent(s) answered at least one question in the feedback section. ",
+  "Comments are shown verbatim, grouped by question, with no response IDs or applicant details. ",
+  "Within each question the order is shuffled so comments cannot be lined up across questions. ",
+  "Email addresses, phone numbers, links and any provider, contact, trainer or signer name typed elsewhere in the form are replaced with [email], [phone], [link] and [name]. ",
+  "Read through once before sharing: other identifying details (for example a training title or a city) are not removed automatically.\n\n"),
+  n_fb))
+```
+
+# Open-ended responses
+
+```{r verbatims, results = "asis"}
+set.seed(params$seed)
+for (k in seq_len(nrow(open_q))) {
+  q <- open_q[k, ]
+  col <- q$cols[[1]][1]
+  qtext <- dat$columns$label[dat$columns$col == col]
+  qtext <- str_squish(str_remove(qtext, "^[^\n]* - (?=[^\n]*$)"))
+  txt <- dat$answers %>% filter(col == !!col, !is.na(num)) %>% pull(num)
+  shown <- dat$qstatus %>% filter(tag == q$tag, applicable, reached) %>% nrow()
+  trivial <- is_trivial_response(txt)
+  keep <- txt[!trivial]
+  keep <- anonymize_text(keep, names_to_redact)
+  keep <- keep[sample.int(length(keep))]
+
+  cat("## ", md_escape(qtext), "\n\n", sep = "")
+  cat(styled(sprintf("%d comment(s) from %d respondent(s) who reached this question%s.",
+                     length(keep), shown,
+                     if (sum(trivial)) sprintf("; %d more answered only 'none', 'n/a' or similar", sum(trivial)) else ""),
+             "Muted"), "\n\n", sep = "")
+  if (length(keep) == 0) {
+    cat("No comments.\n\n")
+  } else {
+    for (t in keep) {
+      cat("- ", gsub("\n\n", "\n\n  ", md_text(t)), "\n", sep = "")
+    }
+    cat("\n")
+  }
+}
+```
+
+```{r rated-head, results = "asis"}
+if (nrow(rated_q) > 0) {
+  cat("# Rated questions in the feedback section\n\n",
+      "Shown for context alongside the comments. 1 = Strongly disagree, 5 = Strongly agree.\n\n", sep = "")
+}
+```
+
+```{r rated-table}
+if (nrow(rated_q) > 0) {
+  rated <- dat$answers %>%
+    filter(tag %in% rated_q$tag) %>%
+    left_join(dat$columns %>% select(col, label), by = "col") %>%
+    mutate(item = if_else(is.na(sublabel), str_squish(str_split_i(label, "\n", 1)), str_squish(sublabel)),
+           score = suppressWarnings(as.integer(num))) %>%
+    left_join(dat$questions %>% select(tag, order), by = "tag")
+  item_order <- rated %>% distinct(item, order, col) %>% arrange(order, col) %>% pull(item) %>% unique()
+  rated_tbl <- rated %>%
+    filter(!is.na(score)) %>%
+    group_by(Item = factor(item, levels = item_order)) %>%
+    summarise(Responses = n(), Mean = sprintf("%.1f", mean(score)),
+              `Agree (4-5)` = sprintf("%.0f%%", 100 * mean(score >= 4)),
+              `Disagree (1-2)` = sprintf("%.0f%%", 100 * mean(score <= 2)), .groups = "drop") %>%
+    mutate(Item = as.character(Item))
+  rated_tbl %>% flextable() %>% ft_style(font_size = 9) %>%
+    align(j = 2:5, align = "center", part = "all") %>%
+    width(j = 1, width = 3.5) %>% width(j = 2:5, width = 0.75) %>% set_table_properties(layout = "fixed")
+}
+```
+
+```{r rated-plot, fig.height = 3.6}
+if (nrow(rated_q) > 0 && any(!is.na(rated$score))) {
+  plot_df <- rated %>% filter(!is.na(score)) %>%
+    count(item, score) %>%
+    group_by(item) %>% mutate(share = n / sum(n)) %>% ungroup() %>%
+    mutate(item = factor(str_wrap(item, 45), levels = rev(str_wrap(item_order, 45))),
+           score = factor(score, levels = 5:1))
+  ggplot(plot_df, aes(share, item, fill = score)) +
+    geom_col(width = 0.7, color = "white", linewidth = 0.5) +
+    scale_fill_manual(values = likert_colors, breaks = as.character(1:5),
+                      labels = c("1 Strongly disagree", "2", "3", "4", "5 Strongly agree"), name = NULL) +
+    scale_x_continuous(labels = function(x) paste0(round(100 * x), "%"), expand = c(0, 0)) +
+    labs(title = "Distribution of ratings", x = NULL, y = NULL) +
+    guides(fill = guide_legend(nrow = 1)) +
+    theme_report(base_size = 8.5) +
+    theme(panel.grid.major.y = element_blank(), legend.text = element_text(size = 7.5))
+}
+```

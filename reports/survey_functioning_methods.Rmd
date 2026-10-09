@@ -1,0 +1,245 @@
+---
+title: "FCECPR Training Registration Form"
+subtitle: "Survey functioning report: methods and code"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  word_document:
+    reference_docx: reference.docx
+    md_extensions: "-tex_math_single_backslash"
+    highlight: tango
+params:
+  project_dir: "."
+  data_rds: "output/prepared_data.rds"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "",
+                      fig.width = 6.5, fig.height = 3.2, dpi = 200)
+source(file.path(params$project_dir, "R", "functions.R"))
+knitr::read_chunk(file.path(params$project_dir, "R", "functioning_calcs.R"))
+dat <- readRDS(params$data_rds)
+
+# Print the source of a named object from R/functions.R, comments included.
+fun_lines <- readLines(file.path(params$project_dir, "R", "functions.R"), warn = FALSE)
+show_source <- function(name) {
+  start <- grep(paste0("^", name, " <- "), fun_lines)[1]
+  if (is.na(start)) return(invisible())
+  nxt <- grep("^([A-Za-z_.][A-Za-z0-9_.]* <- |#'|# ====)", fun_lines)
+  end <- min(c(nxt[nxt > start], length(fun_lines) + 1)) - 1
+  while (end > start && !nzchar(trimws(fun_lines[end]))) end <- end - 1
+  cat("```r\n", paste(fun_lines[start:end], collapse = "\n"), "\n```\n\n", sep = "")
+}
+```
+
+# How to read this document
+
+This is a companion to the *Survey functioning report*. It covers each table and figure in the same order and gives three things for each:
+
+1. **Method**: what is counted, which responses are included, and the numerator, denominator or formula.
+2. **Code**: the exact R code that produced it. Both reports load the same file (`R/functioning_calcs.R`), so the code here is the code that ran.
+3. **Output**: the result for this run, so you can check the code against the numbers.
+
+The calculations depend on a few steps that happen earlier, when the data are prepared. Section 1 describes those steps, and Appendix A has their full code.
+
+```{r run-info, echo = FALSE, results = "asis"}
+cat(sprintf("**This run:** %s. %d responses in the date range, %d excluded, %d analysed. Data: %s.\n\n",
+            dat$date_filter$text,
+            dat$date_filter$n_before - dat$date_filter$n_outside,
+            nrow(dat$excluded), nrow(dat$responses),
+            paste(unlist(dat$files), collapse = ", ")))
+```
+
+# 1. Data preparation (before any table is made)
+
+**1a. Unit of analysis.** One row per Qualtrics response, identified by its **ResponseId**. Nothing is merged across responses, so a person who started the form twice counts as two responses.
+
+**1b. Reading the data.** Both Qualtrics exports are read with every column as text: the numeric-values export (answer codes) and the choice-text export (answer labels). Multi-select answers arrive as codes such as `1,3`. They are split on the comma and matched to labels using the survey Word file, because some answer labels contain commas themselves.
+
+**1c. Date range.** A response is kept when the calendar date (in the display time zone) of its *recorded* date falls between the start and end dates, both included. You can use the *start* date instead (setting `date_field`). For a submitted response, the recorded date is the submission time. For an unfinished response, it is the time Qualtrics closed it.
+
+**1d. Exclusions.** Responses whose Qualtrics *Status* is a preview, test or spam are removed. So are any ResponseIds listed for exclusion. This happens after the date filter.
+
+**1e. Completion group.** Each response gets one group:
+
+- *Completed*: `Finished` = TRUE.
+- *Not submitted (near complete)*: `Finished` = FALSE and `Progress` ≥ the quit cutoff.
+- *Quit*: `Finished` = FALSE and `Progress` < the quit cutoff.
+
+```{r completion-code, echo = FALSE, results = "asis"}
+cat("```r\n",
+    "completion = case_when(\n",
+    "  finished ~ \"Completed\",\n",
+    "  progress >= settings$quit_progress_cutoff ~ \"Not submitted (near complete)\",\n",
+    "  TRUE ~ \"Quit\"\n",
+    ")\n```\n\n", sep = "")
+```
+
+**1f. How far each response got.** The columns are numbered in survey order (the order of the export, which follows the survey flow). A response's `last_position` is the highest-numbered column it answered. For example, `last_position` = 60 means the furthest question answered was column 60.
+
+**1g. Whether a question applied, and whether it was reached.** These are worked out for every response × question pair, in `build_question_status()`:
+
+- **applicable**: FALSE when the form's display logic would hide the question. For example, *Prior submission ID* applies only to resubmissions, renewals and changes, and the FELDS component grids apply only to selected domains. The rules are in `applicability_rules()`. Any question without a rule applies to everyone.
+- **reached**: TRUE when the response was submitted, or when the question's position is at or before `last_position`.
+- **status**: checked in this order, and the first match wins:
+  1. *Not applicable*
+  2. *Answered*: required parts complete, or any part of an optional question
+  3. *Incomplete*: some parts answered but not the required ones
+  4. *Optional - blank*
+  5. *Not reached*
+  6. *Missing*
+
+  A question with several parts (contact name, title, phone, email, for example) counts as answered if any part is filled in, unless `required_parts` says otherwise.
+
+```{r show-status, echo = FALSE, results = "asis"}
+show_source("build_question_status")
+```
+
+# 2. Summary
+
+**Method.** This shared setup chunk builds the objects the later tables use:
+
+- `comp` holds the completed responses with a duration.
+- `kept` is `comp` without the long durations.
+- `rates` has one row per question, with the number of responses it was shown to and the number that answered it.
+- `low` is the required questions whose rate is below the threshold.
+
+The summary table then reports:
+
+- The number of responses at each filtering step.
+- Each completion group's count, as a share of the responses analysed (rounded to whole percent).
+- The median of `kept`.
+- The number of rows in `low`.
+
+```{r fx-setup}
+```
+
+```{r fx-summary}
+```
+
+```{r fx-definitions, results = "asis"}
+```
+
+# 3. Time to complete
+
+**Method.** Duration is Qualtrics' `Duration (in seconds)`, which runs from first opening the form to submitting it. Only *completed* responses are used.
+
+A completion time is set aside (trimmed) when it is longer than the cutoff. With the fixed method, the cutoff is `duration_trim_hours`. With the IQR method, it is the upper quartile + 3 × IQR, which is used only when there are at least 4 completed responses. Trimmed responses are still listed in their own table.
+
+The summary statistics use R's defaults: `median()`, `mean()`, and `quantile()` type 7 for the 25th and 75th percentiles.
+
+```{r fx-time-intro, results = "asis"}
+```
+
+```{r fx-time-table}
+```
+
+**Histogram.** The minutes for `kept` are binned starting at 0. The bin width is the range divided by 15, rounded up to a multiple of 5 minutes, with a minimum of 5. The dashed line is the median.
+
+```{r fx-time-hist, fig.height = 2.8}
+```
+
+```{r fx-time-outliers-head, results = "asis"}
+```
+
+```{r fx-time-outliers}
+```
+
+**Unfinished responses.** This shows the median, minimum and maximum of `Duration` for responses with `Finished` = FALSE. For these, the duration runs to the last activity, not to a submission.
+
+```{r fx-time-unfinished, results = "asis"}
+```
+
+# 4. Where respondents stopped
+
+**Method (step chart).** For each question in survey order, at position *p*:
+
+- **Numerator**: responses that were submitted, or whose `last_position` ≥ *p*.
+- **Denominator**: all responses analysed.
+
+So the line shows the share who got at least as far as each question. The vertical lines mark where each section starts. A drop shows where people stopped answering.
+
+```{r fx-survival, fig.height = 3.4}
+```
+
+**Method (stopping tables).** These use only responses with `Finished` = FALSE:
+
+- *Last section answered* counts responses by the section of their furthest answered question and by completion group.
+- *Last question answered* counts the same responses by the question itself.
+- The list of unfinished responses also shows Qualtrics' *Last Seen Question IDs* (translated to question titles). This is Qualtrics' own record of the last page shown, and it can be later than the last answer.
+
+```{r fx-stop-intro, results = "asis"}
+```
+
+```{r fx-stop-section}
+```
+
+```{r fx-stop-question}
+```
+
+```{r fx-stop-list-head, results = "asis"}
+```
+
+```{r fx-stop-list}
+```
+
+**Method (progress by section).** For unfinished responses, this gives the lowest and highest `Progress` among responses whose last answer was in each section. It shows which Progress values match which section, so you can choose the quit cutoff.
+
+```{r fx-progress-ref-head, results = "asis"}
+```
+
+```{r fx-progress-ref}
+```
+
+# 5. Question response rates
+
+**Method.** One row for each response × question pair (from step 1g) is kept only if the question was **applicable** and **reached**. For each question:
+
+- **Shown to** = the number of rows kept.
+- **Answered** = the rows with status *Answered*.
+- **Rate** = Answered ÷ Shown to.
+
+A required question is flagged when its rate is below `low_response_threshold`. Optional questions, and every question in the feedback section, are never flagged.
+
+```{r fx-rates-intro, results = "asis"}
+```
+
+```{r fx-rates-low-head, results = "asis"}
+```
+
+```{r fx-rates-low}
+```
+
+**Dot plot.** Each point is one question's rate, plotted on the row for its section. Points are spread a little up and down so they don't sit on top of each other. The spread is vertical only, so each point's rate (its horizontal position) is exact, and it uses a fixed seed so the plot is the same every run. The dashed line is the threshold.
+
+```{r fx-rates-plot, fig.height = 3.6}
+```
+
+```{r fx-rates-all}
+```
+
+```{r fx-never-shown, results = "asis"}
+```
+
+# 6. Responses over time
+
+**Method.** Each response is assigned to the week (starting Monday) of its *start* date in the display time zone. The chart counts responses per week, split by completion group.
+
+```{r fx-over-time, fig.height = 2.8}
+```
+
+# Appendix A. Data preparation code
+
+`build_survey_data()` prepares the data that every table above uses. It applies the date range and exclusions, finds how far each response got, and assigns the completion groups.
+
+```{r show-build, echo = FALSE, results = "asis"}
+show_source("build_survey_data")
+```
+
+`applicability_rules()`, `optional_questions` and `required_parts` decide whether a question applies and which of its parts are required.
+
+```{r show-rules, echo = FALSE, results = "asis"}
+show_source("selected")
+show_source("applicability_rules")
+show_source("optional_questions")
+show_source("required_parts")
+```

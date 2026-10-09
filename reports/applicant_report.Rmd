@@ -1,0 +1,276 @@
+---
+output:
+  word_document:
+    reference_docx: reference.docx
+    md_extensions: "-tex_math_single_backslash"
+params:
+  project_dir: "."
+  data_rds: "output/prepared_data.rds"
+  response_id: ""
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+source(file.path(params$project_dir, "R", "functions.R"))
+
+dat  <- readRDS(params$data_rds)
+id   <- params$response_id
+resp <- dat$responses %>% filter(ResponseId == id)
+if (nrow(resp) != 1) stop("Response ", id, " not found in the prepared data.")
+
+ans <- dat$answers %>% filter(ResponseId == id)
+r   <- as.list(dat$raw_numeric[dat$raw_numeric$ResponseId == id, ][1, ])
+qs  <- dat$qstatus %>%
+  filter(ResponseId == id, !is_feedback) %>%
+  left_join(dat$questions %>% select(tag, cols), by = "tag")
+
+# Section order: as set in run_reports.R, then any other non-feedback block
+blocks_present <- as.character(unique(qs$block))
+section_order <- c(intersect(dat$settings$applicant_sections, blocks_present),
+                   setdiff(blocks_present, dat$settings$applicant_sections))
+
+submitted_on <- if (resp$finished) resp$recorded else resp$end
+checks <- application_checks(r, as.Date(submitted_on))
+
+value_of <- function(column) {
+  v <- ans$value[ans$col == column]
+  if (length(v) == 0) character() else v[[1]]
+}
+```
+
+```{r title, results = "asis"}
+cat('::: {custom-style="Title"}\n', md_escape(resp$training_title %||% "Training title not provided"),
+    "\n:::\n\n", sep = "")
+cat('::: {custom-style="Subtitle"}\n',
+    md_escape(paste0("Training application review: ",
+                     resp$provider %||% "Provider not provided", " | ", resp$ResponseId)),
+    "\n:::\n\n", sep = "")
+```
+
+# Application summary
+
+```{r summary-table}
+status_text <- if (resp$finished) {
+  "Submitted"
+} else {
+  sprintf("NOT SUBMITTED: stopped at %s%% progress", resp$progress)
+}
+summary_tbl <- tibble::tribble(
+  ~Field, ~Value,
+  "Response ID",          resp$ResponseId,
+  "Training title",       resp$training_title %||% "-",
+  "Provider/organization", resp$provider %||% "-",
+  "Primary contact",      resp$contact_name %||% "-",
+  "Contact email",        resp$contact_email %||% "-",
+  "Submission status",    status_text,
+  "Started",              fmt_dt(resp$start),
+  if (resp$finished) "Submitted" else "Last activity", fmt_dt(if (resp$finished) resp$recorded else resp$end),
+  "Time spent in the form", fmt_duration(resp$duration_sec)
+)
+ft <- flextable(summary_tbl) %>%
+  ft_style() %>%
+  delete_part("header") %>%
+  bold(j = 1) %>%
+  width(j = 1, width = 1.9) %>%
+  width(j = 2, width = 4.6) %>%
+  set_table_properties(layout = "fixed")
+ft <- ft %>% bold(i = 1, j = 2)
+if (!resp$finished) ft <- ft %>% color(i = 6, j = 2, color = "#B3261E") %>% bold(i = 6, j = 2)
+ft
+```
+
+```{r attempts-note, results = "asis"}
+if (!resp$finished) {
+  cat(styled(paste0(
+    "⚠ This application was not submitted. The respondent's last answer was '",
+    resp$last_title %||% "none", "' in ", as.character(resp$last_block %||% "-"),
+    ". Questions after that point are marked NOT REACHED."), "Missing Flag"), "\n\n")
+}
+if (!resp$has_contact) {
+  cat(styled(paste0(
+    "⚠ The respondent stopped before entering provider and contact details. ",
+    "Use the response ID to refer to this entry."), "Missing Flag"), "\n\n")
+}
+```
+
+# Completeness by section
+
+```{r completeness}
+by_section <- qs %>%
+  filter(!status %in% c("Not applicable"), !optional) %>%
+  group_by(Section = as.character(block)) %>%
+  summarise(
+    `Required questions` = n(),
+    Answered = sum(status == "Answered"),
+    `Missing or incomplete` = sum(status %in% c("Missing", "Incomplete")),
+    `Not reached` = sum(status == "Not reached"),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Status = case_when(
+      Answered == `Required questions` ~ "Complete",
+      `Not reached` == `Required questions` ~ "Not reached",
+      `Missing or incomplete` > 0 & `Not reached` > 0 ~
+        sprintf("Missing %d; %d not reached", `Missing or incomplete`, `Not reached`),
+      `Missing or incomplete` > 0 ~ sprintf("Missing %d", `Missing or incomplete`),
+      TRUE ~ sprintf("Not reached: %d", `Not reached`)
+    ),
+    Section = factor(Section, levels = section_order)
+  ) %>%
+  arrange(Section) %>%
+  mutate(Section = as.character(Section))
+
+flextable(by_section) %>%
+  ft_style() %>%
+  align(j = 2:5, align = "center", part = "all") %>%
+  ft_status_colors(j = "Status")
+```
+
+```{r attention, results = "asis"}
+attention <- qs %>%
+  filter(status %in% c("Missing", "Incomplete", "Not reached")) %>%
+  mutate(block = factor(as.character(block), levels = section_order)) %>%
+  arrange(block, order)
+
+cat("## Required questions needing attention\n\n")
+missing_q <- attention %>% filter(status != "Not reached")
+not_reached <- attention %>% filter(status == "Not reached") %>%
+  count(block, name = "n")
+if (nrow(attention) == 0) {
+  cat(styled("All required questions were answered.", "OK Flag"), "\n\n")
+} else {
+  for (k in seq_len(nrow(missing_q))) {
+    a <- missing_q[k, ]
+    lbl <- if (a$status == "Missing") "missing" else "partly answered"
+    cat("- ", md_escape(paste0(as.character(a$block), ": ", a$title, " (", lbl, ")")), "\n", sep = "")
+  }
+  for (k in seq_len(nrow(not_reached))) {
+    cat("- ", md_escape(sprintf("%s: %d required question(s) not reached",
+                                as.character(not_reached$block[k]), not_reached$n[k])), "\n", sep = "")
+  }
+  cat("\n")
+}
+```
+
+## Automated checks
+
+```{r checks-intro, results = "asis"}
+cat(styled("These checks screen for common problems. Confirm against the uploaded materials before deciding.",
+           "Muted"), "\n\n")
+```
+
+```{r checks}
+flextable(checks) %>%
+  ft_style() %>%
+  width(j = 1, width = 2.7) %>% width(j = 2, width = 0.9) %>% width(j = 3, width = 2.9) %>%
+  set_table_properties(layout = "fixed") %>%
+  ft_status_colors(j = "Result")
+```
+
+```{r answers, results = "asis"}
+mime_short <- function(x) {
+  case_when(
+    is.na(x) ~ "",
+    str_detect(x, "pdf") ~ "PDF",
+    str_detect(x, "wordprocessingml|msword") ~ "Word",
+    str_detect(x, "presentationml|powerpoint") ~ "PowerPoint",
+    str_detect(x, "spreadsheetml|excel|csv") ~ "Excel/CSV",
+    str_detect(x, "^image/") ~ "Image",
+    str_detect(x, "^video/") ~ "Video",
+    TRUE ~ x
+  )
+}
+
+flag_for <- function(status) {
+  switch(status,
+    Missing = styled("⚠ MISSING: required question not answered", "Missing Flag"),
+    Incomplete = styled("⚠ INCOMPLETE: required parts are blank (marked below)", "Missing Flag"),
+    `Not reached` = styled("⚠ NOT REACHED: applicant stopped before this question", "Missing Flag"),
+    `Optional - blank` = styled("Not provided (optional)", "Muted"),
+    NULL)
+}
+
+answer_md <- function(q) {
+  cols <- q$cols[[1]]
+  switch(q$type,
+    text = {
+      v <- value_of(cols[1])
+      if (length(v) == 0) return("")
+      out <- md_text(v)
+      if (q$tag %in% names(word_count_questions)) {
+        rng <- word_count_questions[[q$tag]]
+        out <- paste0(out, "\n\n", styled(sprintf("%d words%s", word_count(v),
+                     if (is.na(rng)) "" else paste0(" (requested: ", rng, ")")), "Muted"))
+      }
+      out
+    },
+    choice = {
+      v <- value_of(cols[1])
+      if (length(v) == 0) "" else if (length(v) == 1) md_escape(v)
+      else paste0("- ", md_escape(v), collapse = "\n")
+    },
+    matrix = {
+      rows <- ans %>% filter(col %in% cols, lengths(value) > 0)
+      if (nrow(rows) == 0) return("")
+      paste0("- **", md_escape(rows$sublabel), "**: ",
+             map_chr(rows$value, ~ md_escape(paste(.x, collapse = "; "))), collapse = "\n")
+    },
+    text_group = {
+      spec <- required_parts[[q$tag]]
+      req <- if (is.null(spec)) character() else if (identical(spec, "all")) cols else spec
+      lines <- map_chr(cols, function(cc) {
+        v <- value_of(cc)
+        lab <- ans$sublabel[ans$col == cc][1]
+        if (length(v) == 0) {
+          if (cc %in% req && q$status != "Not reached")
+            return(paste0("- ", md_escape(lab), ": ", styled("MISSING", "Missing Flag")))
+          return(NA_character_)
+        }
+        paste0("- ", md_escape(lab), ": ", md_escape(paste(v, collapse = "; ")))
+      })
+      paste(na.omit(lines), collapse = "\n")
+    },
+    upload = {
+      get <- function(suffix) { cc <- cols[str_detect(cols, paste0("_", suffix, "$"))]; v <- value_of(cc); if (length(v)) v else NA }
+      if (is.na(get("Name")) && is.na(get("Id"))) return("")
+      paste0("File: **", md_escape(get("Name") %||% "(no name)"), "** (",
+             md_escape(paste(c(mime_short(get("Type")), fmt_bytes(get("Size"))), collapse = ", ")),
+             ")\\\n", styled(paste0("Download from the response in Qualtrics. File ID: ", get("Id")), "Muted"))
+    },
+    ""
+  )
+}
+
+for (sec in section_order) {
+  sq <- qs %>% filter(as.character(block) == sec, status != "Not applicable") %>% arrange(order)
+  if (nrow(sq) == 0) next
+  cat("# ", md_escape(sec), "\n\n", sep = "")
+  if (all(sq$status %in% c("Not reached", "Optional - blank")) && any(sq$status == "Not reached")) {
+    cat(styled("\u26A0 SECTION NOT REACHED: the applicant stopped before this section. None of its questions were answered.",
+               "Missing Flag"), "\n\n", sep = "")
+    next
+  }
+  for (k in seq_len(nrow(sq))) {
+    q <- sq[k, ]
+    cat('::: {custom-style="Question"}\n', md_escape(q$title), "\n:::\n\n", sep = "")
+    f <- flag_for(q$status)
+    body <- answer_md(q)
+    if (!is.null(f)) cat(f, "\n\n", sep = "")
+    if (nzchar(body)) cat(body, "\n\n", sep = "")
+  }
+}
+```
+
+# Reviewer notes
+
+Reviewer: \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_ Date: \_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
+Outcome: ☐ Informal Pathway Designation ☐ Revisions are Required
+
+Notes:
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
